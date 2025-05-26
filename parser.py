@@ -268,7 +268,7 @@ def openai_translate_batch(texts: List[str], src_lang: str, tgt_lang: str) -> Li
     idxs, unique_texts = zip(*filtered)
     prompt = (
         f"Переведи каждый из следующих фрагментов с {src_lang} на {tgt_lang}. "
-        f"Сохрани стиль и смысл. Ответ дай в том же порядке, каждый перевод отделяй строкой '{BATCH_SEPARATOR.strip()}'.\n\n"
+        f"Сохрани стиль и смысл. Ответь в том же порядке, каждый перевод отделяй строкой '{BATCH_SEPARATOR.strip()}'.\n\n"
         + BATCH_SEPARATOR.join(unique_texts)
     )
     try:
@@ -278,7 +278,7 @@ def openai_translate_batch(texts: List[str], src_lang: str, tgt_lang: str) -> Li
             temperature=0.2,
             max_tokens=2048,
         )
-        result = response.choices[0].message.content.strip().split(BATCH_SEPARATOR)
+        result = response.choices[0].message.content.strip().split(BATCH_SEPARATOR.strip())
         # Восстанавливаем исходный порядок, пустые и неуникальные тексты не переводим повторно
         out = list(texts)
         for i, val in zip(idxs, result):
@@ -289,16 +289,45 @@ def openai_translate_batch(texts: List[str], src_lang: str, tgt_lang: str) -> Li
         return texts
 
 
+def translate_plain_text(text: str, src_lang: str, tgt_lang: str) -> str:
+    """Переводит обычный текст без HTML-тегов"""
+    if not text or not text.strip():
+        return text
+    
+    prompt = f"Переведи следующий текст с {src_lang} на {tgt_lang}. Сохрани стиль и смысл:\n\n{text}"
+    try:
+        response = openai.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=1024,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"OpenAI error: {e}")
+        return text
+
+
 def process_row(row, src_col, tgt_col, src_lang, tgt_lang):
     html = str(row.get(src_col, ''))
-    extracted = extract_tagged_text(html)
-    translations = {}
-    for tag, texts in extracted.items():
-        if texts:
-            translations[tag] = openai_translate_batch(texts, src_lang, tgt_lang)
-    if any(translations.values()):
-        new_html = replace_tagged_text(html, translations)
-        row[tgt_col] = new_html
+    
+    # Проверяем, содержит ли текст HTML-теги
+    if any(f'<{tag}' in html.lower() for tag in TAGS):
+        # Обрабатываем HTML-теги
+        extracted = extract_tagged_text(html)
+        translations = {}
+        for tag, texts in extracted.items():
+            if texts:
+                translations[tag] = openai_translate_batch(texts, src_lang, tgt_lang)
+        if any(translations.values()):
+            new_html = replace_tagged_text(html, translations)
+            row[tgt_col] = new_html
+    else:
+        # Переводим обычный текст
+        if html and html.strip():
+            translated_text = translate_plain_text(html, src_lang, tgt_lang)
+            row[tgt_col] = translated_text
+    
     return row
 
 
