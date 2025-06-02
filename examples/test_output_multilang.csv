@@ -1,0 +1,8 @@
+Source Language (EN),Target Language (DE),Target Language (FR),Type
+<h1>Welcome to our store</h1>,"<h1>---
+
+Willkommen in unserem Geschäft</h1>","<h1>---
+
+Bienvenue dans notre magasin</h1>",catalog-product
+<p>This is a <b>premium</b> product with great features.</p>,<p>Dies ist ein Premiumprodukt mit großartigen Funktionen.</p>,<p>Ceci est un produit premium avec d'excellentes fonctionnalités.</p>,wysiwyg.viewer.components.WRichText
+<ul><li>Feature 1</li><li>Feature 2</li></ul>,<ul>Funktion 1Funktion 2</ul>,<ul>Fonctionnalité 1Fonctionnalité 2</ul>,catalog-product

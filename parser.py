@@ -3,20 +3,43 @@
 @description: Парсер и переводчик CSV для тегов HTML с batching запросами к OpenAI, фильтрацией дублей и пустых значений
 @dependencies: pandas, beautifulsoup4, openai, python-dotenv, tqdm
 @created: 2025-05-26
+@updated: 2025-05-26 - добавлена фильтрация типов строк, асинхронность, кэширование
 '''
 
 import pandas as pd
 from bs4 import BeautifulSoup
-from typing import List, Dict
+from typing import List, Dict, Set
 import argparse
 import os
 from dotenv import load_dotenv
 import openai
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
 from tqdm import tqdm
 import logging
+import hashlib
+import json
+import re
 
+# Константы для фильтрации типов строк
+ALLOWED_ROW_TYPES = {
+    'catalog-product',
+    'wysiwyg.viewer.components.WRichText',
+    'document.api.MenuService.Menu'
+}
+
+FORBIDDEN_ROW_TYPES = {
+    'offline_payment_method',
+    'wixui.ImageX',
+    'wix.forms.v4.Form', 
+    'ribbon',
+    'shipping-rule'
+}
+
+# Теги для обычного перевода
 TAGS = ['b', 'h1', 'h2', 'li', 'ol', 'p', 'ul']
+
+# Специальные теги для меню
+MENU_TAGS = ['label']
 
 # Логирование только ошибок
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(levelname)s %(message)s')
@@ -27,7 +50,10 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 openai.api_key = OPENAI_API_KEY
 
 MODEL = 'gpt-4o'
-BATCH_SEPARATOR = '\n---\n'
+BATCH_SEPARATOR = '\n###TRANSLATE_SEPARATOR###\n'
+
+# Кэш для переводов
+translation_cache = {}
 
 LANGUAGE_CODE_TO_NAME = {
     'pl': 'Polish',
@@ -234,59 +260,190 @@ LANGUAGE_CODE_TO_NAME = {
 
 def extract_tagged_text(html: str, tags: List[str] = TAGS) -> Dict[str, List[str]]:
     """
-    Извлекает текст из указанных тегов в HTML-строке.
+    Извлекает текст из указанных тегов в HTML-строке или XML.
     Возвращает словарь: тег -> список текстов.
     """
-    soup = BeautifulSoup(html, 'html.parser')
-    result = {tag: [el.get_text(strip=True) for el in soup.find_all(tag)] for tag in tags}
+    result = {}
+    
+    # Для каждого тега ищем тексты
+    for tag in tags:
+        if tag == 'label':
+            # Для label тегов используем регулярные выражения для XML
+            import re
+            pattern = rf'<{tag}[^>]*>(.*?)</{tag}>'
+            matches = re.findall(pattern, html, re.DOTALL | re.IGNORECASE)
+            result[tag] = [match.strip() for match in matches if match.strip()]
+        else:
+            # Для HTML тегов используем BeautifulSoup
+            soup = BeautifulSoup(html, 'html.parser')
+            elements = soup.find_all(tag)
+            result[tag] = [el.get_text(strip=True) for el in elements if el.get_text(strip=True)]
+    
     return result
 
 
 def replace_tagged_text(html: str, translations: Dict[str, List[str]], tags: List[str] = TAGS) -> str:
-    soup = BeautifulSoup(html, 'html.parser')
+    """
+    Заменяет текст в указанных тегах HTML или XML переводами.
+    """
+    content = html
+    
     for tag in tags:
-        elements = soup.find_all(tag)
-        for i, el in enumerate(elements):
-            if tag in translations and i < len(translations[tag]):
-                el.string = translations[tag][i]
-    return str(soup)
+        if tag in translations:
+            if tag == 'label':
+                # Для label тегов используем регулярные выражения для XML
+                import re
+                pattern = rf'<{tag}[^>]*>(.*?)</{tag}>'
+                matches = list(re.finditer(pattern, content, re.DOTALL | re.IGNORECASE))
+                
+                # Заменяем в обратном порядке, чтобы не сбить позиции
+                for i, match in enumerate(reversed(matches)):
+                    if i < len(translations[tag]):
+                        # Правильный индекс для получения перевода
+                        translation_index = len(matches) - 1 - i
+                        if translation_index < len(translations[tag]):
+                            # Заменяем содержимое между тегами
+                            start_pos = match.start()
+                            end_pos = match.end()
+                            opening_tag = match.group(0)[:match.start(1) - match.start()]
+                            closing_tag = match.group(0)[match.end(1) - match.start():]
+                            new_content = opening_tag + translations[tag][translation_index] + closing_tag
+                            content = content[:start_pos] + new_content + content[end_pos:]
+            else:
+                # Для HTML тегов используем BeautifulSoup
+                soup = BeautifulSoup(content, 'html.parser')
+                elements = soup.find_all(tag)
+                for i, el in enumerate(elements):
+                    if i < len(translations[tag]):
+                        el.string = translations[tag][i]
+                content = str(soup)
+    
+    return content
 
 
 def get_lang_columns(columns: List[str]):
-    src_col = next((c for c in columns if c.lower().startswith('source language')), None)
-    tgt_col = next((c for c in columns if c.lower().startswith('target language')), None)
-    src_lang = src_col.split('(')[-1].replace(')', '').strip() if src_col else None
-    tgt_lang = tgt_col.split('(')[-1].replace(')', '').strip() if tgt_col else None
-    return src_col, tgt_col, src_lang, tgt_lang
+    """Определяет исходную колонку и список целевых колонок на основе заголовков"""
+    source_cols = [col for col in columns if 'source' in col.lower() and 'language' in col.lower()]
+    target_cols = [col for col in columns if 'target' in col.lower() and 'language' in col.lower()]
+    
+    if not source_cols:
+        raise ValueError("Не найдена исходная колонка (должна содержать 'source' и 'language')")
+    
+    return source_cols[0], target_cols
 
 
-def openai_translate_batch(texts: List[str], src_lang: str, tgt_lang: str) -> List[str]:
-    # Убираем пустые и дублирующиеся тексты
-    filtered = [(i, t) for i, t in enumerate(texts) if t and t.strip()]
-    if not filtered:
-        return texts
-    idxs, unique_texts = zip(*filtered)
-    prompt = (
-        f"Переведи каждый из следующих фрагментов с {src_lang} на {tgt_lang}. "
-        f"Сохрани стиль и смысл. Ответь в том же порядке, каждый перевод отделяй строкой '{BATCH_SEPARATOR.strip()}'.\n\n"
-        + BATCH_SEPARATOR.join(unique_texts)
-    )
+async def openai_translate_batch_async(texts: List[str], src_lang: str, tgt_lang: str) -> List[str]:
+    """Асинхронная функция перевода списка текстов одним батчем с кэшированием"""
+    # Проверяем кэш для каждого текста
+    cached_results = []
+    texts_to_translate = []
+    text_indices = []
+    
+    for i, text in enumerate(texts):
+        if not text or not text.strip():
+            cached_results.append('')
+            continue
+            
+        cache_key = get_cache_key(text, src_lang, tgt_lang)
+        if cache_key in translation_cache:
+            cached_results.append(translation_cache[cache_key])
+        else:
+            cached_results.append(None)
+            texts_to_translate.append(text)
+            text_indices.append(i)
+    
+    # Если все тексты закэшированы, возвращаем результат
+    if not texts_to_translate:
+        return [result if result is not None else '' for result in cached_results]
+    
+    # Убираем дублирующиеся тексты для экономии API вызовов
+    unique_texts = list(dict.fromkeys(texts_to_translate))
+    
+    if not unique_texts:
+        return ['' for _ in texts]
+    
     try:
-        response = openai.chat.completions.create(
+        # Создаем асинхронного клиента OpenAI
+        client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+        
+        batch_text = BATCH_SEPARATOR.join(unique_texts)
+        
+        prompt = f"""Переведи следующие тексты с {src_lang} на {tgt_lang}. 
+Сохрани HTML теги и структуру точно как в оригинале. 
+Переводи только содержимое тегов, не сами теги.
+Пронумеруй переводы от 1 до {len(unique_texts)}.
+
+{chr(10).join(f"{i+1}. {text}" for i, text in enumerate(unique_texts))}"""
+
+        response = await client.chat.completions.create(
             model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=2048,
+            messages=[
+                {"role": "system", "content": "Ты переводчик HTML контента. Сохраняй все HTML теги и структуру."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1
         )
-        result = response.choices[0].message.content.strip().split(BATCH_SEPARATOR.strip())
-        # Восстанавливаем исходный порядок, пустые и неуникальные тексты не переводим повторно
-        out = list(texts)
-        for i, val in zip(idxs, result):
-            out[i] = val.strip()
-        return out
+        
+        translated_batch = response.choices[0].message.content.strip()
+        
+        # Парсим нумерованный список переводов
+        translated_list = []
+        import re
+        lines = translated_batch.split('\n')
+        current_translation = ""
+        
+        for line in lines:
+            # Ищем строки, начинающиеся с номера и точки
+            match = re.match(r'^\d+\.\s*(.*)$', line)
+            if match:
+                # Если это новый номер и у нас есть предыдущий перевод, сохраняем его
+                if current_translation:
+                    translated_list.append(current_translation.strip())
+                # Начинаем новый перевод
+                current_translation = match.group(1)
+            else:
+                # Продолжаем текущий перевод
+                if current_translation:
+                    current_translation += '\n' + line
+        
+        # Добавляем последний перевод
+        if current_translation:
+            translated_list.append(current_translation.strip())
+        
+        # Если парсинг не сработал, используем старый метод с разделителем как fallback
+        if len(translated_list) != len(unique_texts):
+            translated_list = translated_batch.split(BATCH_SEPARATOR)
+        
+        # Кэшируем результаты
+        for original, translated in zip(unique_texts, translated_list):
+            cache_key = get_cache_key(original, src_lang, tgt_lang)
+            translation_cache[cache_key] = translated.strip()
+        
+        # Создаем словарь переводов для быстрого поиска
+        translation_dict = {original: translated.strip() for original, translated in zip(unique_texts, translated_list)}
+        
+        # Собираем финальный результат
+        final_results = []
+        translate_index = 0
+        
+        for i, cached_result in enumerate(cached_results):
+            if cached_result is not None:
+                final_results.append(cached_result)
+            else:
+                original_text = texts_to_translate[translate_index]
+                final_results.append(translation_dict.get(original_text, original_text))
+                translate_index += 1
+        
+        return final_results
+        
     except Exception as e:
-        logging.error(f"OpenAI error: {e}")
-        return texts
+        logging.error(f"Ошибка OpenAI API: {e}")
+        return texts  # Возвращаем оригинальные тексты при ошибке
+
+# Оставляем старую синхронную функцию для обратной совместимости
+def openai_translate_batch(texts: List[str], src_lang: str, tgt_lang: str) -> List[str]:
+    """Синхронная обертка для асинхронной функции перевода"""
+    return asyncio.run(openai_translate_batch_async(texts, src_lang, tgt_lang))
 
 
 def translate_plain_text(text: str, src_lang: str, tgt_lang: str) -> str:
@@ -309,26 +466,48 @@ def translate_plain_text(text: str, src_lang: str, tgt_lang: str) -> str:
 
 
 def process_row(row, src_col, tgt_col, src_lang, tgt_lang):
-    html = str(row.get(src_col, ''))
+    """Обрабатывает одну строку CSV с учетом типа строки"""
+    # Проверяем, можно ли переводить эту строку
+    if not is_row_translatable(row):
+        # Если строка не подлежит переводу, возвращаем исходное значение
+        return row[src_col] if pd.notna(row[src_col]) else ''
     
-    # Проверяем, содержит ли текст HTML-теги
-    if any(f'<{tag}' in html.lower() for tag in TAGS):
-        # Обрабатываем HTML-теги
-        extracted = extract_tagged_text(html)
-        translations = {}
-        for tag, texts in extracted.items():
-            if texts:
-                translations[tag] = openai_translate_batch(texts, src_lang, tgt_lang)
-        if any(translations.values()):
-            new_html = replace_tagged_text(html, translations)
-            row[tgt_col] = new_html
-    else:
-        # Переводим обычный текст
-        if html and html.strip():
-            translated_text = translate_plain_text(html, src_lang, tgt_lang)
-            row[tgt_col] = translated_text
+    # Получаем теги для данного типа строки
+    tags_to_process = get_tags_for_row_type(row)
     
-    return row
+    if pd.isna(row[src_col]) or not row[src_col]:
+        return ''
+    
+    original_content = str(row[src_col])
+    
+    # Извлекаем теги для перевода
+    tagged_texts = extract_tagged_text(original_content, tags_to_process)
+    
+    # Собираем все тексты для батчевого перевода
+    all_texts = []
+    for tag_name, texts in tagged_texts.items():
+        all_texts.extend(texts)
+    
+    if not all_texts:
+        # Если нет тегов, проверяем, является ли это простым текстом
+        soup = BeautifulSoup(original_content, 'html.parser')
+        if not soup.find() and original_content.strip():
+            # Это простой текст без тегов
+            return translate_plain_text(original_content, src_lang, tgt_lang)
+        return original_content
+    
+    # Переводим все тексты одним батчем
+    translated_texts = openai_translate_batch(all_texts, src_lang, tgt_lang)
+    
+    # Группируем переводы обратно по тегам
+    translated_by_tag = {}
+    text_index = 0
+    for tag_name, texts in tagged_texts.items():
+        translated_by_tag[tag_name] = translated_texts[text_index:text_index + len(texts)]
+        text_index += len(texts)
+    
+    # Заменяем тексты в HTML
+    return replace_tagged_text(original_content, translated_by_tag, tags_to_process)
 
 
 def add_target_language_column(df):
@@ -338,25 +517,154 @@ def add_target_language_column(df):
 
 
 def main(csv_path: str, output_path: str, limit: int = None):
+    """Основная функция обработки CSV файла"""
+    print(f'Загрузка кэша переводов...')
+    load_cache_from_file()
+    
+    print(f'Чтение файла {csv_path}...')
     df = pd.read_csv(csv_path)
-    df = add_target_language_column(df)
-    src_col, tgt_col, src_lang, tgt_lang = get_lang_columns(df.columns)
-    if not src_col or not tgt_col:
-        raise ValueError('Не найдены колонки Source/Target language')
     
-    # Ограничиваем количество строк, если указано
-    if limit is not None:
+    if limit:
         df = df.head(limit)
+        print(f'Ограничиваем обработку {limit} строками для тестирования')
     
-    tqdm.pandas(desc="Translating rows (batch)")
-    df = df.progress_apply(lambda row: process_row(row, src_col, tgt_col, src_lang, tgt_lang), axis=1)
+    print(f'Найдено {len(df)} строк')
+    
+    # Определяем языковые колонки  
+    src_col, tgt_cols = get_lang_columns(df.columns.tolist())
+    print(f'Исходная колонка: {src_col}')
+    print(f'Целевые колонки: {tgt_cols}')
+    
+    # Определяем исходный язык из названия колонки
+    # Ищем код языка в скобках, например "Source Language (EN)"
+    src_match = re.search(r'\(([A-Za-z]{2,3})\)', src_col)
+    src_lang_code = src_match.group(1).lower() if src_match else 'en'
+    src_lang = LANGUAGE_CODE_TO_NAME.get(src_lang_code, src_lang_code.title())
+    
+    # Добавляем колонку с названием исходного языка
+    add_target_language_column(df)
+    
+    # Фильтруем строки, которые можно переводить
+    translatable_mask = df.apply(is_row_translatable, axis=1)
+    translatable_count = translatable_mask.sum()
+    total_count = len(df)
+    
+    print(f'Строк для перевода: {translatable_count} из {total_count}')
+    
+    # Обрабатываем каждую целевую колонку
+    for tgt_col in tgt_cols:
+        # Определяем целевой язык из названия колонки
+        tgt_match = re.search(r'\(([A-Za-z]{2,3})\)', tgt_col)
+        tgt_lang_code = tgt_match.group(1).lower() if tgt_match else 'en'
+        tgt_lang = LANGUAGE_CODE_TO_NAME.get(tgt_lang_code, tgt_lang_code.title())
+        
+        print(f'Переводим с {src_lang} на {tgt_lang}...')
+        
+        # Инициализируем целевую колонку
+        df[tgt_col] = ''
+        
+        # Обрабатываем только переводимые строки
+        translatable_rows = df[translatable_mask]
+        
+        # Используем tqdm для отображения прогресса
+        with tqdm(total=len(translatable_rows), desc=f'Перевод на {tgt_lang}') as pbar:
+            for idx, row in translatable_rows.iterrows():
+                try:
+                    translated_content = process_row(row, src_col, tgt_col, src_lang, tgt_lang)
+                    df.at[idx, tgt_col] = translated_content
+                except Exception as e:
+                    logging.error(f"Ошибка обработки строки {idx}: {e}")
+                    df.at[idx, tgt_col] = row[src_col] if pd.notna(row[src_col]) else ''
+                pbar.update(1)
+    
+    print(f'Сохранение кэша переводов...')
+    save_cache_to_file()
+    
+    print(f'Сохранение результата в {output_path}...')
     df.to_csv(output_path, index=False)
     print(f'Готово! Результат записан в {output_path}')
+    print(f'Использовано переводов из кэша: {len(translation_cache)}')
+
+
+def get_cache_key(text: str, src_lang: str, tgt_lang: str) -> str:
+    """Генерирует ключ кэша для перевода"""
+    content = f"{text}|{src_lang}|{tgt_lang}"
+    return hashlib.md5(content.encode()).hexdigest()
+
+def save_cache_to_file(cache_file: str = ".translation_cache.json"):
+    """Сохраняет кэш в файл"""
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(translation_cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения кэша: {e}")
+
+def load_cache_from_file(cache_file: str = ".translation_cache.json"):
+    """Загружает кэш из файла"""
+    global translation_cache
+    try:
+        if os.path.exists(cache_file):
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                translation_cache = json.load(f)
+    except Exception as e:
+        logging.error(f"Ошибка загрузки кэша: {e}")
+
+def is_row_translatable(row) -> bool:
+    """Проверяет, можно ли переводить строку на основе её типа"""
+    # Проверяем наличие колонки с типом элемента
+    type_columns = ['Element type', 'element_type', 'type', 'Type', 'row_type', 'Row_Type']
+    row_type = None
+    
+    for col in type_columns:
+        if col in row.index and pd.notna(row[col]):
+            row_type = str(row[col]).strip()
+            break
+    
+    if not row_type:
+        # Если тип не найден, считаем строку переводимой
+        return True
+    
+    # Запрещенные типы
+    if row_type in FORBIDDEN_ROW_TYPES:
+        return False
+    
+    # Разрешенные типы
+    if row_type in ALLOWED_ROW_TYPES:
+        return True
+    
+    # Для остальных типов - не переводим
+    return False
+
+def get_tags_for_row_type(row) -> List[str]:
+    """Возвращает список тегов для перевода в зависимости от типа строки"""
+    type_columns = ['Element type', 'element_type', 'type', 'Type', 'row_type', 'Row_Type']
+    row_type = None
+    
+    for col in type_columns:
+        if col in row.index and pd.notna(row[col]):
+            row_type = str(row[col]).strip()
+            break
+    
+    if row_type == 'document.api.MenuService.Menu':
+        return MENU_TAGS
+    else:
+        return TAGS
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Парсер и переводчик Wix CSV (batch)')
-    parser.add_argument('--input', type=str, default='export_en.csv', help='Путь к исходному CSV')
-    parser.add_argument('--output', type=str, default='translated.csv', help='Путь к выходному CSV')
-    parser.add_argument('--limit', type=int, default=10, help='Количество строк для обработки')
+    parser.add_argument('input_file', type=str, help='Путь к исходному CSV файлу')
+    parser.add_argument('--output', '-o', type=str, default=None, help='Путь к выходному CSV файлу (по умолчанию: добавляется _translated к имени входного файла)')
+    parser.add_argument('--limit', type=int, default=None, help='Ограничить количество обрабатываемых строк для тестирования')
     args = parser.parse_args()
-    main(args.input, args.output, args.limit) 
+    
+    # Если выходной файл не указан, создаем его автоматически
+    if args.output is None:
+        input_name = args.input_file
+        if input_name.endswith('.csv'):
+            output_name = input_name[:-4] + '_translated.csv'
+        else:
+            output_name = input_name + '_translated.csv'
+    else:
+        output_name = args.output
+    
+    main(args.input_file, output_name, args.limit) 

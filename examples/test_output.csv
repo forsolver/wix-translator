@@ -1,0 +1,14 @@
+Source Language (EN),Target Language (DE),Target Language (FR),Type
+<h1>Welcome to our store</h1>,"<h1>I'm sorry, but it seems there is a misunderstanding. The text is already in English. If you need any other assistance, please let me know.</h1>","<h1>I'm sorry, but it seems there is a misunderstanding. The text is already in English. If you need any other assistance, please let me know.</h1>",catalog-product
+<p>This is a <b>premium</b> product with great features.</p>,<p>This is apremiumproduct with great features.</p>,"<p>I'm sorry, but it seems there might be a misunderstanding. The text you've provided is already in English. Could you please clarify what you need?</p>",wysiwyg.viewer.components.WRichText
+<ul><li>Feature 1</li><li>Feature 2</li></ul>,<ul>Feature 1Feature 2</ul>,<ul>Feature 1Feature 2</ul>,catalog-product
+Payment method offline,,,offline_payment_method
+<label>Home</label><label>About</label><label>Contact</label>,"<label>Конечно, вот переведенные тексты:
+
+```html
+Home</label><label>About</label><label>Contact
+```</label>","<label>Конечно, вот переведенные тексты:
+
+```html
+Home</label><label>About</label><label>Contact
+```</label>",document.api.MenuService.Menu

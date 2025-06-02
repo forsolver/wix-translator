@@ -1,0 +1,7 @@
+Source Language (EN),Target Language (DE),Target Language (FR),Type
+"<h1>Welcome to our store</h1>","","","catalog-product"
+"<p>This is a <b>premium</b> product with great features.</p>","","","wysiwyg.viewer.components.WRichText"
+"<ul><li>Feature 1</li><li>Feature 2</li></ul>","","","catalog-product"
+"Payment method offline","","","offline_payment_method"
+"<label>Home</label><label>About</label><label>Contact</label>","","","document.api.MenuService.Menu"
+"Simple text without tags","","","wysiwyg.viewer.components.WRichText" 
