@@ -8,7 +8,7 @@
 '''
 
 import pandas as pd
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from typing import List, Dict, Set
 import argparse
 import os
@@ -20,6 +20,10 @@ import logging
 import hashlib
 import json
 import re
+import warnings
+
+# Подавляем предупреждение о парсинге XML как HTML
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # Структура папок проекта
 INPUT_DIR = 'input'
@@ -374,10 +378,10 @@ async def openai_translate_batch_async(texts: List[str], src_lang: str, tgt_lang
     if not unique_texts:
         return ['' for _ in texts]
     
+    # Создаем асинхронного клиента OpenAI
+    client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+    
     try:
-        # Создаем асинхронного клиента OpenAI
-        client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-        
         batch_text = BATCH_SEPARATOR.join(unique_texts)
         
         prompt = f"""Переведи следующие тексты с {src_lang} на {tgt_lang}. 
@@ -451,6 +455,9 @@ async def openai_translate_batch_async(texts: List[str], src_lang: str, tgt_lang
     except Exception as e:
         logging.error(f"Ошибка OpenAI API: {e}")
         return texts  # Возвращаем оригинальные тексты при ошибке
+    finally:
+        # Правильно закрываем клиент
+        await client.aclose()
 
 # Оставляем старую синхронную функцию для обратной совместимости
 def openai_translate_batch(texts: List[str], src_lang: str, tgt_lang: str) -> List[str]:
