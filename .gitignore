@@ -1,2 +1,14 @@
+# Конфигурация и секреты
 .env
-.translation_cache.json 
+
+# Кэш переводов
+.translation_cache.json
+cache/translation_cache.json
+
+# Временные файлы
+*.tmp
+*.log
+
+# Большие файлы данных (опционально)
+# input/*.csv
+# output/*.csv 

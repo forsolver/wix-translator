@@ -4,6 +4,7 @@
 @dependencies: pandas, beautifulsoup4, openai, python-dotenv, tqdm
 @created: 2025-05-26
 @updated: 2025-05-26 - добавлена фильтрация типов строк, асинхронность, кэширование
+@updated: 2025-12-20 - реорганизация структуры папок проекта
 '''
 
 import pandas as pd
@@ -19,6 +20,17 @@ import logging
 import hashlib
 import json
 import re
+
+# Структура папок проекта
+INPUT_DIR = 'input'
+OUTPUT_DIR = 'output'
+CACHE_DIR = 'cache'
+CACHE_FILE = os.path.join(CACHE_DIR, 'translation_cache.json')
+
+# Создаем папки если их нет
+os.makedirs(INPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Константы для фильтрации типов строк
 ALLOWED_ROW_TYPES = {
@@ -591,7 +603,7 @@ def get_cache_key(text: str, src_lang: str, tgt_lang: str) -> str:
     content = f"{text}|{src_lang}|{tgt_lang}"
     return hashlib.md5(content.encode()).hexdigest()
 
-def save_cache_to_file(cache_file: str = ".translation_cache.json"):
+def save_cache_to_file(cache_file: str = CACHE_FILE):
     """Сохраняет кэш в файл"""
     try:
         with open(cache_file, 'w', encoding='utf-8') as f:
@@ -599,7 +611,7 @@ def save_cache_to_file(cache_file: str = ".translation_cache.json"):
     except Exception as e:
         logging.error(f"Ошибка сохранения кэша: {e}")
 
-def load_cache_from_file(cache_file: str = ".translation_cache.json"):
+def load_cache_from_file(cache_file: str = CACHE_FILE):
     """Загружает кэш из файла"""
     global translation_cache
     try:
@@ -652,19 +664,38 @@ def get_tags_for_row_type(row) -> List[str]:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Парсер и переводчик Wix CSV (batch)')
-    parser.add_argument('input_file', type=str, help='Путь к исходному CSV файлу')
-    parser.add_argument('--output', '-o', type=str, default=None, help='Путь к выходному CSV файлу (по умолчанию: добавляется _translated к имени входного файла)')
+    parser.add_argument('input_file', type=str, help='Путь к исходному CSV файлу (относительно папки input/ или абсолютный путь)')
+    parser.add_argument('--output', '-o', type=str, default=None, help='Путь к выходному CSV файлу (по умолчанию: сохраняется в папку output/)')
     parser.add_argument('--limit', type=int, default=None, help='Ограничить количество обрабатываемых строк для тестирования')
     args = parser.parse_args()
     
-    # Если выходной файл не указан, создаем его автоматически
-    if args.output is None:
-        input_name = args.input_file
-        if input_name.endswith('.csv'):
-            output_name = input_name[:-4] + '_translated.csv'
+    # Обработка входного файла
+    input_file = args.input_file
+    if not os.path.isabs(input_file) and not os.path.exists(input_file):
+        # Проверяем в папке input/
+        input_in_dir = os.path.join(INPUT_DIR, input_file)
+        if os.path.exists(input_in_dir):
+            input_file = input_in_dir
         else:
-            output_name = input_name + '_translated.csv'
-    else:
-        output_name = args.output
+            print(f"Файл не найден: {input_file}")
+            print(f"Проверяемые пути:")
+            print(f"  - {input_file}")
+            print(f"  - {input_in_dir}")
+            exit(1)
     
-    main(args.input_file, output_name, args.limit) 
+    # Обработка выходного файла
+    if args.output is None:
+        # Создаем имя выходного файла автоматически
+        input_basename = os.path.basename(input_file)
+        if input_basename.endswith('.csv'):
+            output_basename = input_basename[:-4] + '_translated.csv'
+        else:
+            output_basename = input_basename + '_translated.csv'
+        output_file = os.path.join(OUTPUT_DIR, output_basename)
+    else:
+        output_file = args.output
+        if not os.path.isabs(output_file):
+            # Если относительный путь, сохраняем в папку output/
+            output_file = os.path.join(OUTPUT_DIR, output_file)
+    
+    main(input_file, output_file, args.limit) 
