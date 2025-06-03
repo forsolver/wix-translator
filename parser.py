@@ -378,86 +378,82 @@ async def openai_translate_batch_async(texts: List[str], src_lang: str, tgt_lang
     if not unique_texts:
         return ['' for _ in texts]
     
-    # Создаем асинхронного клиента OpenAI
-    client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-    
     try:
-        batch_text = BATCH_SEPARATOR.join(unique_texts)
-        
-        prompt = f"""Переведи следующие тексты с {src_lang} на {tgt_lang}. 
+        # Используем async context manager для автоматического управления ресурсами
+        async with openai.AsyncOpenAI(api_key=OPENAI_API_KEY) as client:
+            batch_text = BATCH_SEPARATOR.join(unique_texts)
+            
+            prompt = f"""Переведи следующие тексты с {src_lang} на {tgt_lang}. 
 Сохрани HTML теги и структуру точно как в оригинале. 
 Переводи только содержимое тегов, не сами теги.
 Пронумеруй переводы от 1 до {len(unique_texts)}.
 
 {chr(10).join(f"{i+1}. {text}" for i, text in enumerate(unique_texts))}"""
 
-        response = await client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": "Ты переводчик HTML контента. Сохраняй все HTML теги и структуру."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1
-        )
-        
-        translated_batch = response.choices[0].message.content.strip()
-        
-        # Парсим нумерованный список переводов
-        translated_list = []
-        import re
-        lines = translated_batch.split('\n')
-        current_translation = ""
-        
-        for line in lines:
-            # Ищем строки, начинающиеся с номера и точки
-            match = re.match(r'^\d+\.\s*(.*)$', line)
-            if match:
-                # Если это новый номер и у нас есть предыдущий перевод, сохраняем его
-                if current_translation:
-                    translated_list.append(current_translation.strip())
-                # Начинаем новый перевод
-                current_translation = match.group(1)
-            else:
-                # Продолжаем текущий перевод
-                if current_translation:
-                    current_translation += '\n' + line
-        
-        # Добавляем последний перевод
-        if current_translation:
-            translated_list.append(current_translation.strip())
-        
-        # Если парсинг не сработал, используем старый метод с разделителем как fallback
-        if len(translated_list) != len(unique_texts):
-            translated_list = translated_batch.split(BATCH_SEPARATOR)
-        
-        # Кэшируем результаты
-        for original, translated in zip(unique_texts, translated_list):
-            cache_key = get_cache_key(original, src_lang, tgt_lang)
-            translation_cache[cache_key] = translated.strip()
-        
-        # Создаем словарь переводов для быстрого поиска
-        translation_dict = {original: translated.strip() for original, translated in zip(unique_texts, translated_list)}
-        
-        # Собираем финальный результат
-        final_results = []
-        translate_index = 0
-        
-        for i, cached_result in enumerate(cached_results):
-            if cached_result is not None:
-                final_results.append(cached_result)
-            else:
-                original_text = texts_to_translate[translate_index]
-                final_results.append(translation_dict.get(original_text, original_text))
-                translate_index += 1
-        
-        return final_results
+            response = await client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": "Ты переводчик HTML контента. Сохраняй все HTML теги и структуру."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1
+            )
+            
+            translated_batch = response.choices[0].message.content.strip()
+            
+            # Парсим нумерованный список переводов
+            translated_list = []
+            import re
+            lines = translated_batch.split('\n')
+            current_translation = ""
+            
+            for line in lines:
+                # Ищем строки, начинающиеся с номера и точки
+                match = re.match(r'^\d+\.\s*(.*)$', line)
+                if match:
+                    # Если это новый номер и у нас есть предыдущий перевод, сохраняем его
+                    if current_translation:
+                        translated_list.append(current_translation.strip())
+                    # Начинаем новый перевод
+                    current_translation = match.group(1)
+                else:
+                    # Продолжаем текущий перевод
+                    if current_translation:
+                        current_translation += '\n' + line
+            
+            # Добавляем последний перевод
+            if current_translation:
+                translated_list.append(current_translation.strip())
+            
+            # Если парсинг не сработал, используем старый метод с разделителем как fallback
+            if len(translated_list) != len(unique_texts):
+                translated_list = translated_batch.split(BATCH_SEPARATOR)
+            
+            # Кэшируем результаты
+            for original, translated in zip(unique_texts, translated_list):
+                cache_key = get_cache_key(original, src_lang, tgt_lang)
+                translation_cache[cache_key] = translated.strip()
+            
+            # Создаем словарь переводов для быстрого поиска
+            translation_dict = {original: translated.strip() for original, translated in zip(unique_texts, translated_list)}
+            
+            # Собираем финальный результат
+            final_results = []
+            translate_index = 0
+            
+            for i, cached_result in enumerate(cached_results):
+                if cached_result is not None:
+                    final_results.append(cached_result)
+                else:
+                    original_text = texts_to_translate[translate_index]
+                    final_results.append(translation_dict.get(original_text, original_text))
+                    translate_index += 1
+            
+            return final_results
         
     except Exception as e:
         logging.error(f"Ошибка OpenAI API: {e}")
         return texts  # Возвращаем оригинальные тексты при ошибке
-    finally:
-        # Правильно закрываем клиент
-        await client.aclose()
 
 # Оставляем старую синхронную функцию для обратной совместимости
 def openai_translate_batch(texts: List[str], src_lang: str, tgt_lang: str) -> List[str]:
